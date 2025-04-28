@@ -33,7 +33,7 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                     .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         B, T, C = x.size()
 
         qkv = self.c_attn(x) # (B, T, C*3)
@@ -48,7 +48,7 @@ class CausalSelfAttention(nn.Module):
         # y = att @ v # (B, nh, T, hs)
 
         # Enhancment: The 4th, speeding up from 130ms to 96ms
-        y = F.scaled_dot_product_attention(q, k, v ,is_causal=True)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         
         y = y.transpose(1, 2).contiguous().view(B, T, C) # (B, T, C)
 
@@ -80,8 +80,8 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
     
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, mask=None):
+        x = x + self.attn(self.ln_1(x), mask)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -121,13 +121,15 @@ class GPT(nn.Module):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}."
 
+        mask = (idx != 0).unsqueeze(1).unsqueeze(2).bool() # (B, 1, 1, T)
+        
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
         pos_emb = self.transformer.wpe(pos) # (T, C)
         tok_emb = self.transformer.wte(idx) # (B, T, C)
         x = tok_emb + pos_emb # (B, T, C)
 
         for block in self.transformer.h:
-            x = block(x) # (B, T, C)
+            x = block(x, mask) # (B, T, C)
         
         x = self.transformer.ln_f(x) # (B, T, C)
         # logits = self.lm_head(x) # (B, T, vocab_size)
@@ -182,8 +184,8 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
 
-        for param in model.transformer.parameters():
-            param.requires_grad = False
+        # for param in model.transformer.parameters():
+        #     param.requires_grad = False
 
         return model
 
@@ -313,7 +315,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288 # 512k tokens per step
-B = 16 # batch size in a step
+B = 2 # batch size in a step
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -341,6 +343,37 @@ torch.set_float32_matmul_precision('high')
 # Enhancment: The 5th, speeding up from 96ms to 93ms
 model = GPT.from_pretrained('gpt2', classes_num=classes_num) # (B, T, vocab_size)
 model.to(device)
+
+# model.load_state_dict(torch.load('modeeel.pth', map_location=device), strict=False)
+# model.eval()
+
+# test_set = pd.read_csv('test.csv')
+# test_set["Question"] = test_set["Question"].apply(lambda x: enc.encode(x))
+    
+# npt = test_set["Question"].tolist() # Already tokenized
+# predictions = []
+# with torch.no_grad():
+#     for tokens in npt:
+#         tokens = tokens # (T)
+#         q = torch.tensor(tokens, dtype=torch.long).to(device)
+
+#         if q.shape[0] % T != 0:
+#             mult = q.shape[0] // T + 1
+#             padding = torch.zeros((mult * T - q.shape[0]), dtype=torch.long).to(device)
+#             q = torch.cat((q, padding), dim=0)
+        
+#         q = q.view(-1, T)
+#         logits, _ = model(q) # (1, T, num_classes)
+#         avg_logits = logits.mean(dim=1, keepdim=True)
+#         predictions.append(avg_logits.argmax(dim=-1).item())  # Add .item() to get the scalar value
+
+# test_set["label"] = predictions
+# test_set["translated_label"] = test_set["label"].map(ixtolabel)
+
+# test_set.to_csv('submissioncumi.csv', index=False)
+
+# import sys; sys.exit(0)
+
 # Enhancment: The 3nd, speeding up from 300ms to 130ms
 # model = torch.compile(model)
 if ddp:
@@ -370,12 +403,12 @@ for step in range(max_steps):
     t0 = time.time()
 
     # once in a while evaluate our validation loss
-    if step % 100 == 0:
+    if step % 50 == 0:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
             val_loss_accum = 0.0
-            val_loss_steps = 20
+            val_loss_steps = 50
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
@@ -421,7 +454,14 @@ for step in range(max_steps):
     tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size) / dt
     if master_process:
         print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms, tok/sec : {tokens_per_sec:.2f}")
-    
+
+# store the model state dict
+if master_process:
+    if ddp:
+        raw_model = model.module
+    torch.save(raw_model.state_dict(), 'model.pth')
+    print("model saved to model_more.pth")
+
 if ddp:
     destroy_process_group()
 
