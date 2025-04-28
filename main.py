@@ -315,7 +315,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288 # 512k tokens per step
-B = 2 # batch size in a step
+B = 32 # batch size in a step
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
